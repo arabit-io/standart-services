@@ -1,0 +1,621 @@
+import { bufferToString, decrypt, stringToBuffer, encrypt } from "./utils";
+
+export interface IQueueEnv {}
+export interface IBindingEnv {
+  service_log: any
+}
+
+export interface IBaseServiceEnv extends IQueueEnv, IBindingEnv {
+  kv_env: KVNamespace;
+  q_trace: Queue<any>;
+  q_exception: Queue<any>;
+  TRACE: "0" | "1" | "2";
+  INSTANCE: "stage" | "main" | "test" | "dev";
+  LOG: "0" | "1";
+  EXCEPTION: "0" | "1"
+}
+
+export abstract class TBaseService {
+  protected readonly name: string;
+  protected readonly q_trace: Queue<any>;
+  protected readonly q_exception: Queue<any>;
+  protected readonly kv_env: KVNamespace;
+  protected readonly service_log: any;
+  private _id: string = "";
+  private _trace: number = 0;
+  private _log: number = 0;
+  private _exception: number = 0;
+  abstract maskArray: Array<string>;
+  readonly INSTANCE: "stage" | "main" | "dev" | "test";
+  protected version: string;
+  protected lastServiceCall: { url: string; statusCode: number };
+  protected lastHttpCall: { url: string; statusCode: number };
+
+  constructor(env: IBaseServiceEnv, name: string, version: string) {
+    this.name = name;
+    this.kv_env = env.kv_env;
+    this.id = this.getRandomID();
+    this.trace = env.TRACE ? Number(env.TRACE) : 0;
+    this.exception = env.EXCEPTION ? Number(env.EXCEPTION) : 0;
+    this.q_trace = env.q_trace;
+    this.q_exception = env.q_exception;
+    this.INSTANCE = env.INSTANCE;
+    this.log = env.LOG ? Number(env.LOG) : 0;
+    this.version = version;
+    this.service_log = env.service_log;
+  }
+
+  get trace(): number {
+    return this._trace;
+  }
+  set trace(trace: string | number) {
+    this._trace = Number(trace);
+  }
+
+  get id(): string {
+    return this._id;
+  }
+  set id(id: string) {
+    this._id = id;
+  }
+
+  get log(): number {
+    return this._log;
+  }
+  set log(log: number) {
+    this._log = log;
+  }
+
+  get exception(): number {
+    return this._exception;
+  }
+  set exception(exception: string | number) {
+    this._exception = Number(exception);
+  }
+
+  async getKVParam(kvKey: string, cryptoPass?: string) {
+    let value: string;
+    if (cryptoPass) {
+      let result = await this.getKVParamWithMetadata(kvKey, cryptoPass);
+      if (result?.value) {
+        value = result.value;
+      }
+    } else {
+      value = await this.kv_env.get(this.name + "_" + kvKey);
+    }
+    return value;
+  }
+
+  async getKVParamWithMetadata(kvKey: string, cryptoPass?: string) {
+    let result: {
+      value: string;
+      metadata: { [key: string]: any };
+    } = await this.kv_env.getWithMetadata(this.name + "_" + kvKey);
+    if (cryptoPass && result.value && result?.metadata?.iv) {
+      result.value = bufferToString(
+        await decrypt(
+          result.value,
+          kvKey,
+          stringToBuffer(result.metadata.iv),
+          cryptoPass
+        )
+      );
+    }
+    return result;
+  }
+
+  async setKVParam(
+    kvKey: string,
+    kvValue: string,
+    expirationInSeconds?: number,
+    metadata?: {},
+    cryptoPass?: string
+  ) {
+    let params: { [key: string]: any } = {};
+    if (metadata) {
+      params.metadata = metadata;
+    }
+    if (expirationInSeconds !== undefined && expirationInSeconds >= 60) {
+      params.expirationTtl = expirationInSeconds;
+    }
+    if (cryptoPass) {
+      let iv = crypto.getRandomValues(new Uint8Array(12));
+      let encryptedValue = await encrypt(kvValue, kvKey, iv, cryptoPass);
+      if (params.metadata) {
+        params.metadata.iv = bufferToString(iv);
+      } else {
+        params.metadata = { iv: bufferToString(iv) };
+      }
+      await this.kv_env.put(
+        this.name + "_" + kvKey,
+        bufferToString(encryptedValue),
+        params
+      );
+    } else {
+      await this.kv_env.put(this.name + "_" + kvKey, kvValue, params);
+    }
+  }
+
+  async deleteKVParam(kvKey: string) {
+    await this.kv_env.delete(this.name + "_" + kvKey);
+  }
+
+  async getKVList(prefix?: string, limit?: number, cursor?: string) {
+    let params: { prefix?: string; limit?: number; cursor?: string } = {};
+    if (prefix) {
+      params.prefix = prefix;
+    }
+    if (limit) {
+      params.limit = limit;
+    }
+    if (cursor) {
+      params.cursor = cursor;
+    }
+    if (Object.keys(params).length) {
+      return await this.kv_env.list(params);
+    }
+    return await this.kv_env.list();
+  }
+
+  async setDurableKVParam(
+    stub: DurableObject,
+    key: string,
+    value: string,
+    expire?: number,
+    meta?: { [key: string]: any },
+    cryptoPass?: string,
+    clear?: number
+  ): Promise<any> {
+    let params: {
+      key: string;
+      value: string;
+      expire?: number;
+      meta?: { [key: string]: any };
+      clear?: number;
+    } = {
+      key: key,
+      value: value,
+      meta: meta,
+      expire: expire,
+      clear: clear,
+    };
+
+    if (cryptoPass) {
+      let iv = crypto.getRandomValues(new Uint8Array(12));
+      let encryptedValue = await encrypt(value, key, iv, cryptoPass);
+      params.value = bufferToString(encryptedValue);
+      if (params.meta) {
+        params.meta.iv = bufferToString(iv);
+      } else {
+        params.meta = { iv: bufferToString(iv) };
+      }
+    }
+    let request = new Request(
+      "https://v1/kv",
+      this.generateHttpInit("POST", JSON.stringify(params))
+    );
+    let response = await stub.fetch(request);
+    return await response.json();
+  }
+
+  async getDurableKVParamWithMetadata(
+    stub: DurableObject,
+    key: string,
+    cryptoPass?: string
+  ): Promise<any> {
+    try {
+      let request = new Request("https://v1/kv", this.generateHttpInit("GET"));
+      let response = await stub.fetch(request);
+      if (response.status === 200) {
+        let result: {
+          key: string;
+          value: string;
+          expire?: number;
+          meta?: { [key: string]: any };
+        } = await response.json();
+
+        if (cryptoPass && result.value && result?.meta?.iv) {
+          result.value = bufferToString(
+            await decrypt(
+              result.value,
+              key,
+              stringToBuffer(result.meta.iv),
+              cryptoPass
+            )
+          );
+        }
+        return result;
+      } else {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  async getDurableKVParam(
+    stub: DurableObject,
+    key: string,
+    cryptoPass?: string
+  ): Promise<any> {
+    let result = await this.getDurableKVParamWithMetadata(
+      stub,
+      key,
+      cryptoPass
+    );
+    return result?.value;
+  }
+
+  async deleteDurableKVParamWithMetadata(stub: DurableObject): Promise<any> {
+    let request = new Request("https://v1/kv", this.generateHttpInit("DELETE"));
+    let response = await stub.fetch(request);
+    let result = await response.json();
+    return result;
+  }
+
+  protected generateHttpInit(
+    method: string,
+    body?: BodyInit,
+    additionalHeaders?: {},
+    cf?: RequestInitCfProperties,
+    redirect?: string
+  ) {
+    let headers = {
+      "Content-Type": "application/json",
+      f2x_request_id: this.id,
+      f2x_trace: this.trace.toString(),
+    };
+    if (additionalHeaders) {
+      headers = Object.assign(headers, additionalHeaders);
+    }
+
+    let init: {
+      method: string;
+      headers: {};
+      body?: BodyInit;
+      cf?: RequestInitCfProperties;
+      redirect?: string;
+    } = {
+      method: method,
+      headers: headers,
+    };
+
+    if (body) {
+      init.body = body;
+    }
+
+    if (cf) {
+      init.cf = cf;
+    }
+
+    if (redirect) {
+      init.redirect = redirect;
+    }
+
+    return init;
+  }
+
+  protected maskInfo(str: string) {
+    for (let field of this.maskArray) {
+      str = str.replaceAll(field, "MASKED");
+    }
+    return str;
+  }
+
+  async processMaskArray(responseBody: any) {}
+
+  protected async getTraceMessageHttpRequest(
+    requestClone: Request,
+    requestBody: string
+  ) {
+    let requestHeaders = Object.fromEntries(requestClone.headers);
+    let requestURL = new URL(requestClone.url);
+    let requestMethod = requestClone.method.toLowerCase();
+
+    let message: {
+      requestURL: URL;
+      requestMethod: string;
+      requestBody: string;
+      requestHeaders?: {};
+    } = {
+      requestURL: requestURL,
+      requestMethod: requestMethod,
+      requestBody: requestBody,
+    };
+    if (this.trace === 2) {
+      message = {
+        requestURL: requestURL,
+        requestMethod: requestMethod,
+        requestHeaders: requestHeaders,
+        requestBody: requestBody,
+      };
+    }
+    return JSON.stringify(message, null, 2);
+  }
+
+  protected async getLogMessageHttpRequest(
+    requestClone: Request,
+    requestBody: string,
+    requestTime: number
+  ) {
+    let requestHeaders = Object.fromEntries(requestClone.headers);
+    let requestURL = requestClone.url;
+    let requestMethod = requestClone.method.toLowerCase();
+
+    let message: {
+      requestTime: number;
+      requestURL: string;
+      requestMethod: string;
+      requestBody: string;
+      requestHeaders: { [key: string]: string };
+    } = {
+      requestTime: requestTime,
+      requestURL: requestURL,
+      requestMethod: requestMethod,
+      requestBody: requestBody,
+      requestHeaders: requestHeaders,
+    };
+
+    return message;
+  }
+
+  protected async getExceptionMessage(exception: any, url: string, body: any) {
+    let exceptionMessage: {
+      lastHttpCall: { url: string; statusCode: number };
+      lastServiceCall: { url: string; statusCode: number };
+      url: string;
+      body: any;
+      code: string;
+      message: string;
+      stack?: string;
+    } = {
+      lastHttpCall: this.lastHttpCall,
+      lastServiceCall: this.lastServiceCall,
+      url: url,
+      body: body,
+      code: exception.code,
+      message: exception.message,
+    };
+
+    if (this.exception) {
+      exceptionMessage.stack = exception.stack;
+      let queueMessage = {
+        serviceName: this.name,
+        time: new Date(Date.now()).toISOString(),
+        message: this.maskInfo(JSON.stringify(exceptionMessage, null, 2)).slice(
+          0,
+          5000
+        ),
+      };
+      await this.q_exception.send(queueMessage);
+      console.log(queueMessage);
+    }
+    if (this.trace) {
+      exceptionMessage.stack = exception.stack;
+    }
+    return this.maskInfo(JSON.stringify(exceptionMessage, null, 2));
+  }
+
+  protected async getTraceMessageHttpResponse(
+    responseClone: Response,
+    responseBody: string
+  ) {
+    let responseUrl = responseClone.url;
+    let responseHeaders = Object.fromEntries(responseClone.headers);
+    let responseStatus = responseClone.status;
+
+    let message: {
+      url: string;
+      responseStatus: number;
+      responseBody: string;
+      responseHeaders?: {};
+    } = {
+      url: responseUrl,
+      responseStatus: responseStatus,
+      responseBody: responseBody,
+    };
+    if (this.trace === 2) {
+      message = {
+        url: responseUrl,
+        responseStatus: responseStatus,
+        responseHeaders: responseHeaders,
+        responseBody: responseBody,
+      };
+    }
+    return JSON.stringify(message, null, 2);
+  }
+
+  protected async getLogMessageHttpResponse(
+    responseClone: Response,
+    responseBody: string,
+    responseTime: number
+  ) {
+    let responseStatus = responseClone.status;
+
+    let message: {
+      responseStatus: number;
+      responseBody: string;
+      responseTime: number;
+    } = {
+      responseStatus: responseStatus,
+      responseBody: responseBody,
+      responseTime: responseTime,
+    };
+
+    return message;
+  }
+
+  async callService(
+    env: IBaseServiceEnv,
+    name: keyof IBindingEnv,
+    url: string,
+    method: string,
+    params?: BodyInit,
+    headers?: {},
+    contentType?: string
+  ): Promise<any> {
+    let service = env[name] as Fetcher;
+    let serviceUrl = `https://${name}/${url}`;
+    let response = await service.fetch(
+      serviceUrl,
+      this.generateHttpInit(method, params, headers)
+    );
+    this.lastServiceCall = { url: serviceUrl, statusCode: response.status };
+
+    if (contentType === "blob") {
+      return await response.blob();
+    }
+
+    return await response.json();
+  }
+
+  async callHttp(
+    url: string,
+    method: string,
+    params?: BodyInit,
+    headers?: {},
+    cf?: RequestInitCfProperties,
+    redirect?: string
+  ) {
+    let request = new Request(
+      url,
+      this.generateHttpInit(method, params, headers, cf, redirect)
+    );
+    let requestTime = new Date().getTime();
+    let clonedRequest = request.clone();
+    let requestBody = await clonedRequest.text();
+
+    if (this.trace) {
+      let reqMessage = await this.getTraceMessageHttpRequest(
+        clonedRequest,
+        requestBody
+      );
+      await this.traceMessage(reqMessage, "http_request");
+    }
+
+    let response = await fetch(request);
+    let responseTime = new Date().getTime();
+    let clonedResponse = response.clone();
+    let responseBody: any = await clonedResponse.text();
+
+    try {
+      await this.processMaskArray(responseBody);
+    } catch {}
+    
+    if (this.log) {
+      let logRequestMessage = await this.getLogMessageHttpRequest(
+        clonedRequest,
+        requestBody,
+        requestTime
+      );
+
+      let logResponseMessage = await this.getLogMessageHttpResponse(
+        clonedResponse,
+        responseBody,
+        responseTime
+      );
+
+      await this.logMessage(logRequestMessage, logResponseMessage);
+    }
+
+    this.lastHttpCall = { url: url, statusCode: response.status };
+    if (this.trace) {
+      let respMessage = await this.getTraceMessageHttpResponse(
+        clonedResponse,
+        responseBody
+      );
+      await this.traceMessage(
+        respMessage,
+        "http_response",
+        undefined,
+        responseTime - requestTime
+      );
+    }
+    return response;
+  }
+
+  async sendQueue(env: IBaseServiceEnv, queue: keyof IQueueEnv, message: any) {
+    let result = {
+      id: this.id,
+      trace: this.trace,
+      message: message,
+    };
+    let queueStorage = env[queue] as Queue<any>;
+    await queueStorage.send(result);
+  }
+
+  protected async traceMessage(
+    message: string,
+    type: string,
+    error?: {},
+    deltatime?: number
+  ) {
+    let result = {
+      serviceName: this.name,
+      type: type,
+      id: this.id,
+      time: new Date(Date.now()).toISOString(),
+      deltatime: deltatime,
+      error: error,
+      message: this.maskInfo(message).slice(0, 5000),
+      trace: this.trace,
+    };
+    try {
+      await this.service_log.saveServiceTraceLog(result);
+    } catch (e) {
+      console.log("saveServiceTraceLogException", e);
+    }
+    this.q_trace.send(result);
+    console.log(result);
+  }
+
+  protected async logMessage(
+    requestMessage: {
+      requestTime: number;
+      requestURL: string;
+      requestMethod: string;
+      requestBody: string;
+      requestHeaders: { [key: string]: string };
+    },
+    responseMessage: {
+      responseStatus: number;
+      responseBody: string;
+      responseTime: number;
+    }
+  ) {
+    try {
+      let in_json: any = this.maskInfo(requestMessage.requestBody);
+      let out_json: any = this.maskInfo(responseMessage.responseBody);
+
+      try {
+        in_json = JSON.parse(in_json);
+      } catch {}
+
+      try {
+        out_json = JSON.parse(out_json);
+      } catch {}
+
+      await this.service_log.saveServiceHttpLog({
+        serviceName: this.name,
+        requestTime: requestMessage.requestTime,
+        url: requestMessage.requestURL,
+        method: requestMessage.requestMethod,
+        status: responseMessage.responseStatus,
+        responseTime: responseMessage.responseTime,
+        in_json: in_json,
+        out_json: out_json,
+        ip: requestMessage.requestHeaders["f2x_ip"]
+          ? requestMessage.requestHeaders["f2x_ip"]
+          : requestMessage.requestHeaders["x-real-ip"],
+        f2xUserAgent: requestMessage.requestHeaders["f2x_user_agent"],
+        f2xRequestId: requestMessage.requestHeaders["f2x_request_id"],
+      });
+    } catch (e) {
+      console.log("logMessageException", e);
+    }
+  }
+
+  private getRandomID() {
+    return crypto.randomUUID();
+  }
+}
